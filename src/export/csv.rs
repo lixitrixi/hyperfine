@@ -21,6 +21,7 @@ impl Exporter for CsvExporter {
     ) -> Result<Vec<u8>> {
         let mut writer = WriterBuilder::new().from_writer(vec![]);
 
+        let mut num_params = 0;
         {
             let mut headers: Vec<Cow<[u8]>> = [
                 // The list of times and exit codes cannot be exported to the CSV file - omit them.
@@ -29,7 +30,10 @@ impl Exporter for CsvExporter {
             .iter()
             .map(|x| Cow::Borrowed(x.as_bytes()))
             .collect();
-            if let Some(res) = results.first() {
+
+            // Use param column names from the first non-reference command
+            if let Some(res) = results.iter().find(|res| !res.parameters.is_empty()) {
+                num_params = res.parameters.len();
                 for param_name in res.parameters.keys() {
                     headers.push(Cow::Owned(format!("parameter_{param_name}").into_bytes()));
                 }
@@ -50,8 +54,13 @@ impl Exporter for CsvExporter {
             ] {
                 fields.push(Cow::Owned(f.to_string().into_bytes()))
             }
-            for v in res.parameters.values() {
-                fields.push(Cow::Borrowed(v.as_bytes()))
+            if res.parameters.is_empty() && num_params > 0 {
+                // Reference command, insert an empty column for each param
+                fields.append(&mut vec![Cow::Borrowed("".as_bytes()); num_params]);
+            } else {
+                for v in res.parameters.values() {
+                    fields.push(Cow::Borrowed(v.as_bytes()))
+                }
             }
             writer.write_record(fields)?;
         }
@@ -119,5 +128,62 @@ fn test_csv() {
     command,mean,stddev,median,user,system,min,max,parameter_bar,parameter_foo
     command_a,1,2,1,3,4,5,6,two,one
     command_b,11,12,11,13,14,15,16.5,seven,one
+    "#);
+}
+
+// Regression test for https://github.com/sharkdp/hyperfine/issues/852
+#[test]
+fn test_csv_parameters_with_reference_command() {
+    use std::collections::BTreeMap;
+    let exporter = CsvExporter::default();
+
+    let results = vec![
+        BenchmarkResult {
+            command: String::from("command_ref"),
+            command_with_unused_parameters: String::from("command_ref"),
+            mean: 1.0,
+            stddev: Some(2.0),
+            median: 1.0,
+            user: 3.0,
+            system: 4.0,
+            min: 5.0,
+            max: 6.0,
+            times: Some(vec![7.0, 8.0, 9.0]),
+            memory_usage_byte: None,
+            exit_codes: vec![Some(0), Some(0), Some(0)],
+            parameters: BTreeMap::new(),
+        },
+        BenchmarkResult {
+            command: String::from("command_arg"),
+            command_with_unused_parameters: String::from("command_arg"),
+            mean: 11.0,
+            stddev: Some(12.0),
+            median: 11.0,
+            user: 13.0,
+            system: 14.0,
+            min: 15.0,
+            max: 16.5,
+            times: Some(vec![17.0, 18.0, 19.0]),
+            memory_usage_byte: None,
+            exit_codes: vec![Some(0), Some(0), Some(0)],
+            parameters: {
+                let mut params = BTreeMap::new();
+                params.insert("foo".into(), "one".into());
+                params
+            },
+        },
+    ];
+
+    let actual = String::from_utf8(
+        exporter
+            .serialize(&results, Some(Unit::Second), SortOrder::Command)
+            .unwrap(),
+    )
+    .unwrap();
+
+    insta::assert_snapshot!(actual, @r#"
+    command,mean,stddev,median,user,system,min,max,parameter_foo
+    command_ref,1,2,1,3,4,5,6,
+    command_arg,11,12,11,13,14,15,16.5,one
     "#);
 }
